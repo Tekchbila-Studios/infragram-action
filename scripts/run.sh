@@ -26,6 +26,14 @@ get_oidc_token() {
 command -v curl >/dev/null || fail "curl is required."
 command -v node >/dev/null || fail "Node.js is required."
 
+# Validated before anything expensive runs. Discovering a typo here after a
+# ten-minute plan, at the point of upload, is the worst possible time.
+secret_scan="${INPUT_SECRET_SCAN:-block}"
+case "$secret_scan" in
+  block|warn|off) ;;
+  *) fail "secret-scan must be one of: block, warn, off. Got: $secret_scan" ;;
+esac
+
 preflight_file="$(mktemp "${RUNNER_TEMP:-/tmp}/infragram-preflight.XXXXXX")"
 temp_dir=""
 cleanup() {
@@ -75,6 +83,15 @@ else
     plan_args+=("-var-file=$var_file")
   done <<< "${INPUT_VAR_FILES:-}"
 
+  # Read line by line rather than word-split, so a value containing spaces
+  # reaches Terraform as one argument instead of several.
+  while IFS= read -r var_override; do
+    [[ -z "$var_override" ]] && continue
+    [[ "$var_override" != -* ]] || fail "vars entries must be key=value, not flags."
+    [[ "$var_override" == *=* ]] || fail "vars entries must be key=value. Got: $var_override"
+    plan_args+=("-var=$var_override")
+  done <<< "${INPUT_VARS:-}"
+
   if [[ -n "${INPUT_TERRAFORM_ARGS:-}" ]]; then
     read -r -a extra_args <<< "$INPUT_TERRAFORM_ARGS"
     plan_args+=("${extra_args[@]}")
@@ -85,25 +102,44 @@ fi
 bundle="$temp_dir/bundle.json"
 terraform -chdir="$workdir" show -json "$plan_path" | "$collector" -output "$bundle"
 
-case "$(uname -m)" in
-  x86_64|amd64)
-    gitleaks_arch="x64"
-    gitleaks_sha="$GITLEAKS_LINUX_X64_SHA256"
-    ;;
-  aarch64|arm64)
-    gitleaks_arch="arm64"
-    gitleaks_sha="$GITLEAKS_LINUX_ARM64_SHA256"
-    ;;
-  *) fail "Unsupported runner architecture: $(uname -m)" ;;
-esac
+if [[ "$secret_scan" == "off" ]]; then
+  # Said loudly on purpose. The collector still removed Terraform-sensitive
+  # paths and credential-shaped attributes above; what is skipped is the
+  # independent pass over the exact bytes about to be uploaded.
+  printf '::warning::Infragr.am secret scanning is off for this run. The bundle was sanitized but not independently scanned before upload.\n'
+else
+  case "$(uname -m)" in
+    x86_64|amd64)
+      gitleaks_arch="x64"
+      gitleaks_sha="$GITLEAKS_LINUX_X64_SHA256"
+      ;;
+    aarch64|arm64)
+      gitleaks_arch="arm64"
+      gitleaks_sha="$GITLEAKS_LINUX_ARM64_SHA256"
+      ;;
+    *) fail "Unsupported runner architecture: $(uname -m)" ;;
+  esac
 
-archive="$temp_dir/gitleaks.tar.gz"
-curl --fail --silent --show-error --location \
-  "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${gitleaks_arch}.tar.gz" \
-  --output "$archive"
-printf '%s  %s\n' "$gitleaks_sha" "$archive" | sha256sum --check --status || fail "Gitleaks checksum verification failed."
-tar -xzf "$archive" -C "$temp_dir" gitleaks
-"$temp_dir/gitleaks" stdin --no-banner --redact=100 < "$bundle" || fail "Gitleaks found a potential secret in sanitized output; nothing was uploaded."
+  archive="$temp_dir/gitleaks.tar.gz"
+  curl --fail --silent --show-error --location \
+    "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${gitleaks_arch}.tar.gz" \
+    --output "$archive"
+  printf '%s  %s\n' "$gitleaks_sha" "$archive" | sha256sum --check --status || fail "Gitleaks checksum verification failed."
+  tar -xzf "$archive" -C "$temp_dir" gitleaks
+
+  # Gitleaks exits 1 for findings. Any other non-zero status means Gitleaks
+  # itself failed, and a scanner that could not run is never a warning — that
+  # path uploads nothing regardless of the configured mode.
+  scan_status=0
+  "$temp_dir/gitleaks" stdin --no-banner --redact=100 < "$bundle" || scan_status=$?
+  if [[ "$scan_status" -gt 1 ]]; then
+    fail "Gitleaks could not complete the scan (exit $scan_status); nothing was uploaded."
+  fi
+  if [[ "$scan_status" -eq 1 ]]; then
+    [[ "$secret_scan" == "warn" ]] || fail "Gitleaks found a potential secret in sanitized output; nothing was uploaded."
+    printf '::warning::Gitleaks flagged a potential secret in the sanitized bundle. secret-scan is set to warn, so it was uploaded anyway.\n'
+  fi
+fi
 
 oidc_token="$(get_oidc_token)"
 
@@ -113,6 +149,7 @@ status="$(curl --silent --show-error --output "$response_file" --write-out '%{ht
   -H "Authorization: Bearer $oidc_token" \
   -H "Content-Type: application/json" \
   -H "X-Infragram-Event: ${GITHUB_EVENT_NAME:-unknown}" \
+  -H "X-Infragram-Environment: ${INPUT_ENVIRONMENT:-}" \
   -H "X-Infragram-PR: $(node -e 'const fs=require("fs"); try { const e=JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,"utf8")); process.stdout.write(String(e.number||e.pull_request?.number||"")) } catch {}')" \
   --data-binary "@$bundle")"
 if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
