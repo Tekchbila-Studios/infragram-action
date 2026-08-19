@@ -74,7 +74,18 @@ if [[ -n "${INPUT_PLAN_PATH:-}" ]]; then
   [[ -f "$plan_path" ]] || fail "Terraform plan does not exist: $plan_path"
 else
   plan_path="$temp_dir/terraform.tfplan"
-  terraform -chdir="$workdir" init -input=false -lockfile=readonly
+
+  # Deliberately NOT -lockfile=readonly. A committed lock file is still honoured
+  # in full — plain init selects exactly the versions it records and only
+  # resolves what the lock cannot satisfy. Readonly turned two ordinary
+  # situations into a dead end instead: a repository that never committed a lock
+  # file, and the far more common one where the lock was generated on a
+  # developer's macOS machine and carries no linux_amd64 hashes for this runner.
+  # Nothing is written back either way; the checkout dies with the runner.
+  if [[ ! -f "$workdir/.terraform.lock.hcl" ]]; then
+    printf '::notice::No .terraform.lock.hcl in %s. Provider versions for this plan were resolved from your version constraints. Commit a lock file (terraform providers lock -platform=linux_amd64) to pin them.\n' "${INPUT_WORKING_DIRECTORY:-.}"
+  fi
+  terraform -chdir="$workdir" init -input=false
 
   plan_args=(plan -input=false -no-color -out="$plan_path")
   while IFS= read -r var_file; do
