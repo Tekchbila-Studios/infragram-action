@@ -14,7 +14,7 @@ This repository contains the complete collection and sanitization path:
 
 Standard profile keeps useful topology, including IP addresses, CIDRs, ports, names, regions, zones, and relationships. It removes passwords, keys, tokens, private key material, user data, connection strings, and all values marked sensitive by Terraform. More privacy profiles may be added through later bundle schema versions; only `standard` exists today.
 
-Gitleaks is defense in depth, not proof that arbitrary data contains no secret. Review collector source and `schemas/bundle-v1.schema.json` before adoption.
+Gitleaks is defense in depth, not proof that arbitrary data contains no secret. Review collector source and `schemas/bundle-v2.schema.json` before adoption.
 
 ### Secret scan mode
 
