@@ -72,6 +72,17 @@ collector="$temp_dir/infragram-collect"
 if [[ -n "${INPUT_PLAN_PATH:-}" ]]; then
   plan_path="$(realpath "$INPUT_PLAN_PATH")"
   [[ -f "$plan_path" ]] || fail "Terraform plan does not exist: $plan_path"
+
+  # `terraform show -json` renders a saved plan using the provider SCHEMAS, so
+  # the plugins have to be on disk even though no provider is ever configured
+  # and no cloud API is called. Skipping init here worked only by accident, when
+  # an earlier step in the same job had already populated .terraform; a plan
+  # downloaded from another workflow run failed at the show below.
+  #
+  # -backend=false is what keeps this credential-free: providers are installed,
+  # the backend is never initialized, so no state access and no cloud identity
+  # are needed to turn someone else's plan into a bundle.
+  terraform -chdir="$workdir" init -input=false -backend=false
 else
   plan_path="$temp_dir/terraform.tfplan"
 
@@ -155,13 +166,19 @@ fi
 oidc_token="$(get_oidc_token)"
 
 response_file="$temp_dir/response.json"
+# The pull request number is how a build finds the conversation to comment on.
+# `pull_request` events carry it directly; a `workflow_run` build — the shape
+# used when the plan comes from another workflow's artifact — carries it under
+# workflow_run.pull_requests instead. GitHub leaves that array empty for pull
+# requests opened from a fork, so a fork build still reports no number and the
+# API is expected to treat the header as optional.
 status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
   -X POST "${INPUT_API_URL%/}/api/action/runs" \
   -H "Authorization: Bearer $oidc_token" \
   -H "Content-Type: application/json" \
   -H "X-Infragram-Event: ${GITHUB_EVENT_NAME:-unknown}" \
   -H "X-Infragram-Environment: ${INPUT_ENVIRONMENT:-}" \
-  -H "X-Infragram-PR: $(node -e 'const fs=require("fs"); try { const e=JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,"utf8")); process.stdout.write(String(e.number||e.pull_request?.number||"")) } catch {}')" \
+  -H "X-Infragram-PR: $(node -e 'const fs=require("fs"); try { const e=JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,"utf8")); process.stdout.write(String(e.number||e.pull_request?.number||e.workflow_run?.pull_requests?.[0]?.number||"")) } catch {}')" \
   --data-binary "@$bundle")"
 if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
   message="$(node -e 'const fs=require("fs"); try { const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(x.error||"request failed") } catch { process.stdout.write("request failed") }' "$response_file")"
