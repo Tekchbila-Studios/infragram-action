@@ -54,8 +54,8 @@ jobs:
   diagram:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
       - uses: Tekchbila-Studios/infragram-action@v1
         with:
           working-directory: infrastructure
