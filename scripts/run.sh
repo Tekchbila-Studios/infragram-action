@@ -234,9 +234,46 @@ while :; do
   fail "Infragr.am API returned HTTP $status: ${message:-request failed}"
 done
 
-node - "$response_file" "$GITHUB_OUTPUT" <<'NODE'
+# Emits the identifiers on stdout as well as into the step outputs, because the
+# run ID is what support needs to find a build and an output is invisible to the
+# person reading the log.
+run_meta="$(node - "$response_file" "$GITHUB_OUTPUT" <<'NODE'
 const fs = require("fs");
 const response = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-fs.appendFileSync(process.argv[3], `run-id=${response.run.id}\nrun-url=${response.run_url}\n`);
+const id = response.run && response.run.id;
+if (!id) {
+  process.stderr.write("::error::Infragr.am accepted the build but returned no run id.\n");
+  process.exit(1);
+}
+const url = response.run_url || "";
+fs.appendFileSync(process.argv[3], `run-id=${id}\nrun-url=${url}\n`);
+process.stdout.write(`${id}\n${url}\n`);
 NODE
+)"
+run_id="$(printf '%s\n' "$run_meta" | sed -n 1p)"
+run_url="$(printf '%s\n' "$run_meta" | sed -n 2p)"
+
+# Three surfaces on purpose. The annotation is what someone sees without opening
+# the job; the plain lines survive into downloaded raw logs, where annotations do
+# not; the summary is the one a person can copy out of on a phone.
+printf '::notice::Infragr.am run ID %s. Quote this when raising a support case. %s\n' "$run_id" "$run_url"
 printf 'Sanitization and independent Gitleaks scan passed. Diagram build submitted.\n'
+printf 'Infragr.am run ID: %s\n' "$run_id"
+if [[ -n "$run_url" ]]; then
+  printf 'Infragr.am build URL: %s\n' "$run_url"
+fi
+printf 'Quote the run ID above when raising a support case.\n'
+
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  {
+    printf '### Infragr.am diagram build\n\n'
+    if [[ -n "${INPUT_ENVIRONMENT:-}" ]]; then
+      printf -- '- Environment: `%s`\n' "$INPUT_ENVIRONMENT"
+    fi
+    printf -- '- Run ID: `%s`\n' "$run_id"
+    if [[ -n "$run_url" ]]; then
+      printf -- '- Build: %s\n' "$run_url"
+    fi
+    printf -- '- Quote the run ID when raising a support case.\n'
+  } >> "$GITHUB_STEP_SUMMARY"
+fi
