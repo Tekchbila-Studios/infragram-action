@@ -138,7 +138,37 @@ else
     read -r -a extra_args <<< "$INPUT_TERRAFORM_ARGS"
     plan_args+=("${extra_args[@]}")
   fi
-  terraform -chdir="$workdir" "${plan_args[@]}"
+  # A plan is allowed to fail in exactly one way without failing the build.
+  #
+  # Terraform cannot plan a configuration whose count or for_each depends on a
+  # value that does not exist until apply — an IPAM-allocated CIDR, an ID from a
+  # resource not yet created. It refuses rather than guessing, so there is no
+  # plan to diagram and no amount of retrying produces one.
+  #
+  # That is not the customer's build being broken, and failing the step says it
+  # is. Worse, one such root turns a whole matrix red even when every other
+  # environment produced a diagram, and "Invalid count argument" gives no hint
+  # that this is a known limitation rather than a mistake they made.
+  #
+  # Every other plan failure still fails the step. This is matched narrowly, on
+  # both the diagnostic heading and its body, so a genuinely invalid for_each is
+  # not waved through: the body wraps across lines in Terraform's output, which
+  # is why it is matched separately rather than as one phrase.
+  plan_log="$temp_dir/plan.log"
+  set +e
+  terraform -chdir="$workdir" "${plan_args[@]}" 2>&1 | tee "$plan_log"
+  plan_status=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "$plan_status" -ne 0 ]]; then
+    if grep -qE 'Error: Invalid (count|for_each) argument' "$plan_log" \
+      && grep -q 'cannot be determined' "$plan_log"; then
+      printf '::warning::No diagram for %s: Terraform cannot plan it, because a count or for_each depends on values that only exist after apply. This is a Terraform limitation rather than a problem with your configuration. Apply what those counts depend on first, or point the action at a root that can be planned.\n' \
+        "${INPUT_WORKING_DIRECTORY:-.}"
+      exit 0
+    fi
+    fail "terraform plan failed with exit $plan_status. Its output is above."
+  fi
 fi
 
 bundle="$temp_dir/bundle.json"
