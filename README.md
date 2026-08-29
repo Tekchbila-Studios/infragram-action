@@ -92,7 +92,9 @@ Existing pipelines may provide a binary plan instead:
 
 `plan-path` avoids another `terraform init` and `terraform plan`. Infragr.am never requests cloud credentials; Terraform receives them from the surrounding customer workflow.
 
-Preflight exits successfully without planning when the repository is inactive, not activated, over its monthly build allowance, rate-limited, or already at its concurrent-run limit. Submission repeats these checks to prevent races between workflows.
+Preflight exits successfully without planning when the repository is inactive, not activated, over its monthly build allowance, or rate-limited. Submission repeats these checks to prevent races between workflows.
+
+Reaching the account's concurrent-build limit is not one of those cases. A workflow that builds several variants of one repository posts them within seconds of each other and is expected to reach it, so submission waits and retries for up to five minutes rather than skipping the build. Every other refusal fails the step immediately, because none of them clear inside a workflow run.
 
 ## Current constraints
 

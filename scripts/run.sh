@@ -6,6 +6,11 @@ readonly GITLEAKS_LINUX_X64_SHA256="a65b5253807a68ac0cafa4414031fd740aeb55f54fb7
 readonly GITLEAKS_LINUX_ARM64_SHA256="eff65261156100e5d94a6b3dec313d532fddfe19ae1590bf7a2b4f2699128356"
 readonly AUDIENCE="infragr.am"
 
+# Total time to spend waiting out the API's concurrency limit before giving up.
+# Long enough to outlast a burst of sibling builds, short enough that a genuine
+# backlog surfaces as a failure rather than a runner sitting idle.
+readonly MAX_QUEUE_WAIT_SECONDS=300
+
 fail() {
   printf '::error::%s\n' "$1" >&2
   exit 1
@@ -20,6 +25,21 @@ get_oidc_token() {
     "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")"
   node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync(0,"utf8")).value; if(!value) process.exit(1); process.stdout.write(value)' <<< "$response" || \
     fail "GitHub did not issue an OIDC token."
+}
+
+# Reads one top-level string or number out of a JSON response body, empty when
+# the body is missing, unparseable, or has no such key. Every API error path is
+# expected to produce JSON, but a proxy or a gateway timeout may not.
+response_field() {
+  node -e 'const fs=require("fs"); try { const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const v=x[process.argv[2]]; process.stdout.write(v==null?"":String(v)) } catch {}' "$1" "$2"
+}
+
+# How long to wait before retrying a build the API asked us to queue. The server
+# suggests a delay; this clamps it so a bad value can neither spin nor park the
+# runner for minutes at a time.
+retry_delay_seconds() {
+  node -e 'const ms=Number(process.argv[1]); const s=Number.isFinite(ms)&&ms>0?Math.ceil(ms/1000):30; process.stdout.write(String(Math.min(60,Math.max(5,s))))' \
+    "$(response_field "$1" retryAfterMs)"
 }
 
 [[ "${RUNNER_OS:-}" == "Linux" ]] || fail "Infragr.am Action currently supports Linux runners only."
@@ -163,27 +183,56 @@ else
   fi
 fi
 
-oidc_token="$(get_oidc_token)"
-
 response_file="$temp_dir/response.json"
+
 # The pull request number is how a build finds the conversation to comment on.
 # `pull_request` events carry it directly; a `workflow_run` build — the shape
 # used when the plan comes from another workflow's artifact — carries it under
 # workflow_run.pull_requests instead. GitHub leaves that array empty for pull
 # requests opened from a fork, so a fork build still reports no number and the
 # API is expected to treat the header as optional.
-status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
-  -X POST "${INPUT_API_URL%/}/api/action/runs" \
-  -H "Authorization: Bearer $oidc_token" \
-  -H "Content-Type: application/json" \
-  -H "X-Infragram-Event: ${GITHUB_EVENT_NAME:-unknown}" \
-  -H "X-Infragram-Environment: ${INPUT_ENVIRONMENT:-}" \
-  -H "X-Infragram-PR: $(node -e 'const fs=require("fs"); try { const e=JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,"utf8")); process.stdout.write(String(e.number||e.pull_request?.number||e.workflow_run?.pull_requests?.[0]?.number||"")) } catch {}')" \
-  --data-binary "@$bundle")"
-if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
-  message="$(node -e 'const fs=require("fs"); try { const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(x.error||"request failed") } catch { process.stdout.write("request failed") }' "$response_file")"
-  fail "Infragr.am API returned HTTP $status: $message"
-fi
+pr_number="$(node -e 'const fs=require("fs"); try { const e=JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,"utf8")); process.stdout.write(String(e.number||e.pull_request?.number||e.workflow_run?.pull_requests?.[0]?.number||"")) } catch {}')"
+
+# The API limits how many builds one account may have in flight. A workflow that
+# builds several variants of a repository trips that by design — the steps run
+# in parallel and post within seconds of each other — so a `too_many_concurrent`
+# refusal is a queue, not a rejection, and waiting is the correct response. By
+# this point the plan, the sanitization and the secret scan have all already
+# run; failing here would throw that away over a few seconds of contention.
+#
+# The other two refusals — an exhausted monthly quota and the daily allowance —
+# clear in days, not seconds. Those fail immediately.
+waited=0
+while :; do
+  # Re-minted per attempt: GitHub's OIDC tokens are short-lived and the wait
+  # below can span several minutes.
+  oidc_token="$(get_oidc_token)"
+
+  status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+    -X POST "${INPUT_API_URL%/}/api/action/runs" \
+    -H "Authorization: Bearer $oidc_token" \
+    -H "Content-Type: application/json" \
+    -H "X-Infragram-Event: ${GITHUB_EVENT_NAME:-unknown}" \
+    -H "X-Infragram-Environment: ${INPUT_ENVIRONMENT:-}" \
+    -H "X-Infragram-PR: $pr_number" \
+    --data-binary "@$bundle")"
+
+  if [[ "$status" -ge 200 && "$status" -lt 300 ]]; then
+    break
+  fi
+
+  if [[ "$status" == "429" && "$(response_field "$response_file" reason)" == "too_many_concurrent" \
+        && "$waited" -lt "$MAX_QUEUE_WAIT_SECONDS" ]]; then
+    delay="$(retry_delay_seconds "$response_file")"
+    printf '::notice::This account already has the maximum number of builds rendering. Retrying in %ss.\n' "$delay"
+    sleep "$delay"
+    waited=$((waited + delay))
+    continue
+  fi
+
+  message="$(response_field "$response_file" error)"
+  fail "Infragr.am API returned HTTP $status: ${message:-request failed}"
+done
 
 node - "$response_file" "$GITHUB_OUTPUT" <<'NODE'
 const fs = require("fs");
