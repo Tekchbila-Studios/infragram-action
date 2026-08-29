@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://infragr.am/schemas/bundle-v2.schema.json",
+  "$id": "https://infragr.am/schemas/bundle-v3.schema.json",
   "title": "Infragr.am sanitized Terraform bundle",
   "type": "object",
   "additionalProperties": false,
@@ -11,7 +11,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 2
+      "const": 3
     },
     "terraform_version": {
       "type": "string"
@@ -60,40 +60,48 @@
         }
       }
     },
-    "relationships": {
+    "references": {
+      "description": "Every reference each configured resource makes, unresolved. Sources and refs are the addresses the configuration writes, qualified by module and without count subscripts; expanding them against `resources`, and deciding which instance pairs with which, is the renderer's job.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": [
           "source",
-          "target",
+          "ref",
           "block_index"
         ],
         "properties": {
           "source": {
-            "type": "string"
-          },
-          "target": {
-            "type": "string"
+            "type": "string",
+            "description": "The referring resource, without count subscripts."
           },
           "via": {
             "type": "string",
-            "description": "Attribute carrying the reference. When block_type is set, this is the attribute inside that block, not the block itself."
+            "description": "The attribute carrying the reference; within a nested block when block_type is set."
           },
           "block_type": {
             "type": "string",
-            "description": "Enclosing nested block, absent for a top-level attribute."
+            "description": "Enclosing nested block, empty for a top-level attribute."
           },
           "block_index": {
             "type": "integer",
-            "minimum": -1,
-            "description": "Ordinal of the enclosing block instance, or -1 for a top-level attribute. Pairs a reference with the sibling attributes of the same block."
+            "description": "Ordinal of the enclosing block instance, -1 for a top-level attribute. Always encoded: 0 is meaningful."
           },
-          "raw_ref": {
+          "ref": {
             "type": "string",
-            "description": "Reference as Terraform wrote it, before truncation to a resource address."
+            "description": "What the reference names, normalized to an address: a resource, or a local that keys into `symbols`."
           }
+        }
+      }
+    },
+    "symbols": {
+      "description": "What each module-qualified local references. Values never appear: a local holding a literal has no references and is omitted.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
         }
       }
     },

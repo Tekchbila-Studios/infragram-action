@@ -142,7 +142,12 @@ else
 fi
 
 bundle="$temp_dir/bundle.json"
-terraform -chdir="$workdir" show -json "$plan_path" | "$collector" -output "$bundle"
+# -source points the collector at the configuration it just planned. Terraform's
+# JSON plan carries no locals, so without it every reference written as
+# `vpc_id = local.vpc_id` — which is how the registry's modules are built — names
+# something the plan never defines and is lost. The collector reads only `locals`
+# blocks from those files, and only the names and references inside them.
+terraform -chdir="$workdir" show -json "$plan_path" | "$collector" -source "$workdir" -output "$bundle"
 
 if [[ "$secret_scan" == "off" ]]; then
   # Said loudly on purpose. The collector still removed Terraform-sensitive

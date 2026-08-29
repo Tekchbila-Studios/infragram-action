@@ -8,13 +8,28 @@ This repository contains the complete collection and sanitization path:
 
 1. An OIDC-authenticated preflight checks repository activation and account eligibility.
 2. Terraform creates a binary plan locally only when eligible.
-3. `infragram-collect` retains resource topology and removes Terraform-sensitive paths plus credential-shaped attributes.
+3. `infragram-collect` retains resource topology and removes Terraform-sensitive paths plus credential-shaped attributes. It also reads `locals` blocks from the configuration's `.tf` files — see below.
 4. Gitleaks independently scans the exact serialized bundle.
 5. Only that scanned bundle is sent to Infragr.am.
 
 Standard profile keeps useful topology, including IP addresses, CIDRs, ports, names, regions, zones, and relationships. It removes passwords, keys, tokens, private key material, user data, connection strings, and all values marked sensitive by Terraform. More privacy profiles may be added through later bundle schema versions; only `standard` exists today.
 
-Gitleaks is defense in depth, not proof that arbitrary data contains no secret. Review collector source and `schemas/bundle-v2.schema.json` before adoption.
+### What is read from your `.tf` files
+
+Terraform's JSON plan contains no locals. A module that writes `vpc_id = local.vpc_id` — which is how the widely used registry modules are built — produces a plan saying an attribute references `local.vpc_id` and never saying what that is. Every such reference used to be discarded, which cost those modules the links between their resources.
+
+So the collector also reads the configuration directory it just planned. What it takes is deliberately narrow:
+
+- **only** `locals` blocks, and **only** the names and the references inside them
+- **never** an attribute's value, never file contents, never anything else
+
+A local holding a literal contributes nothing. `locals { db_password = "hunter2" }` has no references and is dropped entirely. Even a mixed expression yields only the reference: `locals { x = "prefix-${aws_vpc.main.cidr_block}-suffix" }` emits `aws_vpc.main` and no part of the string. `TestScanLocalsNeverEmitsValues` pins this.
+
+The bundle carries what the configuration says and stops there: `references` is every reference each resource makes, unresolved, and `symbols` is what the locals name. Resolving them — matching a reference to a resource, deciding which instance of a counted resource it means — happens after upload.
+
+That split is deliberate. Extraction and redaction are this repository's job and are auditable here. Interpreting a reference for a diagram is not, and keeping it here meant every change to it needed a new release of this action in every workflow using it.
+
+Gitleaks is defense in depth, not proof that arbitrary data contains no secret. Review collector source and `schemas/bundle-v3.schema.json` before adoption.
 
 ### Secret scan mode
 
