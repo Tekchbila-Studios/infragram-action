@@ -64,7 +64,37 @@ jobs:
             environments/production.tfvars
 ```
 
-Variable files form one Terraform plan. Order matters: later files override earlier files. Create another Action step when a second environment needs a separate plan and diagram build.
+Variable files form one Terraform plan. Order matters: later files override earlier files.
+
+A second environment needs its own plan and its own diagram build. Reach for a matrix rather than a second step: steps in a job run one after another, so two environments mean two full `init` + `plan` + scan cycles back to back, while matrix legs are separate jobs that run at the same time.
+
+```yaml
+jobs:
+  diagram:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [staging, production]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - uses: Tekchbila-Studios/infragram-action@v1
+        with:
+          working-directory: infrastructure
+          environment: ${{ matrix.environment }}
+          var-files: |
+            environments/common.tfvars
+            environments/${{ matrix.environment }}.tfvars
+```
+
+Passing `environment` is required here, not decorative. Runs supersede each other within an environment, so two builds that both leave it unset are read as the same build and the later one replaces the earlier — the pull request ends up with one diagram instead of two.
+
+`fail-fast: false` stops a plan failure in one environment from cancelling the other environment's diagram.
+
+Leave `concurrency` at the workflow level, as in the example above. Moving it onto the job puts every matrix leg in one group, where `cancel-in-progress: true` has the legs cancel each other. A per-job group has to carry the matrix value in its name to stay correct.
+
+Legs post within seconds of each other and are expected to reach the account's concurrent-build limit; submission queues rather than failing, as described below.
 
 Individual variables can be overridden with `vars`, one `key=value` per line, passed as `-var`:
 
@@ -95,6 +125,10 @@ Existing pipelines may provide a binary plan instead:
 Preflight exits successfully without planning when the repository is inactive, not activated, over its monthly build allowance, or rate-limited. Submission repeats these checks to prevent races between workflows.
 
 Reaching the account's concurrent-build limit is not one of those cases. A workflow that builds several variants of one repository posts them within seconds of each other and is expected to reach it, so submission waits and retries for up to five minutes rather than skipping the build. Every other refusal fails the step immediately, because none of them clear inside a workflow run.
+
+## Reporting a problem
+
+Every accepted build prints its run ID to the job log, raises it as a job annotation, and writes it to the job summary along with the build URL and, when set, the environment. It is also available to later steps as the `run-id` output. Quote that ID when raising a support case — it is how a build is located.
 
 ## Current constraints
 
