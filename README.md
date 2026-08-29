@@ -153,6 +153,21 @@ Every accepted build prints its run ID to the job log, raises it as a job annota
 - GitHub App must be installed and repository activated in Infragr.am
 - One Terraform root and one ordered variable-file set per Action invocation
 - Additional Terraform arguments must not contain secrets; use `TF_VAR_*` environment variables backed by GitHub secrets
+- A root whose `count` or `for_each` depends on values that only exist after apply cannot be planned, so it cannot be diagrammed
+
+### Roots that cannot be planned
+
+Terraform refuses to plan a configuration whose `count` or `for_each` depends on a value that does not exist until apply — an IPAM-allocated CIDR, an ID from a resource not yet created:
+
+```
+Error: Invalid count argument
+The "count" value depends on resource attributes that cannot be determined
+until apply, so Terraform cannot predict how many instances will be created.
+```
+
+There is no plan to diagram, and retrying cannot produce one. The Action reports this as a warning and exits successfully, so one such root does not turn a whole matrix red when every other environment produced a diagram. Apply what those counts depend on first, or point the Action at a root that can be planned.
+
+Every other plan failure still fails the step.
 
 ## Development
 
