@@ -1,15 +1,12 @@
 package collect
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -57,6 +54,9 @@ type configModule struct {
 
 type configModuleCall struct {
 	Module *configModule `json:"module"`
+	// Source locates a module whose directory the manifest does not record,
+	// which is the case for a local path module.
+	Source string `json:"source"`
 }
 
 type configResource struct {
@@ -66,7 +66,20 @@ type configResource struct {
 
 // FromPlanJSON decodes `terraform show -json` output and returns the sanitized
 // bundle built from it.
+//
+// No configuration directory, so no locals: every reference that goes through
+// one stays unresolved. FromPlanJSONWithSource is what a runner should call.
 func FromPlanJSON(input io.Reader) (*Bundle, error) {
+	return FromPlanJSONWithSource(input, "")
+}
+
+// FromPlanJSONWithSource additionally reads the configuration's locals from the
+// .tf files under sourceDir, which the plan JSON does not carry.
+//
+// Only `locals` blocks are read, and only the names and references inside them.
+// An unreadable or absent directory is not an error: it yields a bundle with no
+// symbols, which is exactly what version 2 produced.
+func FromPlanJSONWithSource(input io.Reader, sourceDir string) (*Bundle, error) {
 	decoder := json.NewDecoder(io.LimitReader(input, maxPlanBytes))
 	// Numbers are kept as their original literals. Round-tripping them through
 	// float64 would rewrite ports and CIDR-adjacent values that the renderer reads
@@ -81,30 +94,17 @@ func FromPlanJSON(input io.Reader) (*Bundle, error) {
 		return nil, errors.New("input is not Terraform plan JSON: format_version missing")
 	}
 
-	result := collect(plan)
+	result := collect(plan, sourceDir)
 	return &result, nil
 }
 
-func collect(plan rawPlan) Bundle {
+func collect(plan rawPlan, sourceDir string) Bundle {
 	result := Bundle{
 		SchemaVersion:    SchemaVersion,
 		TerraformVersion: plan.TerraformVersion,
 		FormatVersion:    plan.FormatVersion,
 		Resources:        make([]Resource, 0, len(plan.ResourceChanges)),
 		Stats:            Stats{Profile: "standard"},
-	}
-
-	// Configuration addresses a resource once ("aws_subnet.this") while the plan
-	// addresses every instance count produced ("module.vpc.aws_subnet.this[0]").
-	// Index the instances by their subscript-free form so a reference written
-	// against the configuration can find the concrete resources it names.
-	instances := make(map[string][]string, len(plan.ResourceChanges))
-	for _, change := range plan.ResourceChanges {
-		bare := bareAddress(change.Address)
-		instances[bare] = append(instances[bare], change.Address)
-	}
-	for _, list := range instances {
-		sort.Strings(list)
 	}
 
 	for _, change := range plan.ResourceChanges {
@@ -120,7 +120,18 @@ func collect(plan rawPlan) Bundle {
 		})
 	}
 	sort.Slice(result.Resources, func(i, j int) bool { return result.Resources[i].Address < result.Resources[j].Address })
-	result.Relationships = collectRelationships(plan.Configuration, instances)
+	result.References = collectReferences(plan.Configuration)
+
+	if sourceDir != "" && len(result.References) > 0 {
+		scanner := newSymbolScanner(sourceDir)
+		scanner.scan(plan.Configuration.RootModule, scanner.rootPath, "")
+		if len(scanner.symbols) > 0 {
+			for _, refs := range scanner.symbols {
+				sort.Strings(refs)
+			}
+			result.Symbols = scanner.symbols
+		}
+	}
 	return result
 }
 
@@ -203,154 +214,91 @@ func normalizeKey(value string) string {
 	return result.String()
 }
 
-func collectRelationships(configuration *config, instances map[string][]string) []Relation {
+// collectReferences reports every reference each configured resource makes,
+// exactly as written and without resolving any of it.
+//
+// Resolution used to happen here: a reference was matched against the plan's
+// resources, paired to the right instance of a counted resource, deduplicated,
+// and anything left over was discarded. All of that moved to the renderer.
+//
+// The division is between extracting and interpreting. What a configuration
+// says is a fact about the customer's repository and belongs in the open, where
+// it can be audited. What a reference *means* for a diagram — which instance it
+// pairs with, whether it implies containment — is a product decision, and
+// keeping it here meant every new diagramming rule needed a new release of this
+// action in every customer's workflow.
+//
+// Sources are the addresses the configuration uses, without count subscripts.
+// The renderer expands them against the resources the bundle carries.
+func collectReferences(configuration *config) []Reference {
 	if configuration == nil || configuration.RootModule == nil {
 		return nil
 	}
-	relations := make(map[string]Relation)
-	collectModuleRelationships(configuration.RootModule, "", instances, relations)
+	seen := make(map[Reference]bool)
+	collectModuleReferences(configuration.RootModule, "", seen)
 
-	result := make([]Relation, 0, len(relations))
-	for _, item := range relations {
+	result := make([]Reference, 0, len(seen))
+	for item := range seen {
 		result = append(result, item)
 	}
-	// Materializing from a map leaves the order undefined, and the receiver's
-	// output must be byte-identical for identical input, so sort on every field
-	// that distinguishes two relations.
+	// Materializing from a map leaves the order undefined, and the emitted
+	// bundle must be byte-identical for identical input.
 	sort.Slice(result, func(i, j int) bool {
 		left, right := result[i], result[j]
 		switch {
 		case left.Source != right.Source:
 			return left.Source < right.Source
-		case left.Target != right.Target:
-			return left.Target < right.Target
+		case left.Ref != right.Ref:
+			return left.Ref < right.Ref
 		case left.Via != right.Via:
 			return left.Via < right.Via
 		case left.BlockType != right.BlockType:
 			return left.BlockType < right.BlockType
-		case left.BlockIndex != right.BlockIndex:
-			return left.BlockIndex < right.BlockIndex
 		default:
-			return left.RawRef < right.RawRef
+			return left.BlockIndex < right.BlockIndex
 		}
 	})
 	return result
 }
 
-// collectModuleRelationships walks one configuration module. prefix is the module
+// collectModuleReferences walks one configuration module. prefix is the module
 // path this body sits under ("" at the root, "module.network" one level down).
 //
-// Threading the prefix is what makes cross-module edges survive: inside a module
-// body Terraform writes addresses relative to that module ("aws_vpc.main"), while
-// resource_changes addresses them absolutely ("module.network.aws_vpc.main"). An
-// unprefixed walk produces targets that match nothing and are silently discarded.
-func collectModuleRelationships(module *configModule, prefix string, instances map[string][]string, relations map[string]Relation) {
+// Threading the prefix is what makes cross-module references usable: inside a
+// module body Terraform writes addresses relative to that module
+// ("aws_vpc.main"), while the plan addresses them absolutely
+// ("module.network.aws_vpc.main"). An unprefixed reference names something else
+// entirely, or nothing.
+func collectModuleReferences(module *configModule, prefix string, seen map[Reference]bool) {
 	for _, current := range module.Resources {
-		sources := instances[bareAddress(qualify(prefix, current.Address))]
-		if len(sources) == 0 {
+		source := qualifyRef(prefix, strings.Split(current.Address, "."))
+		if source == "" {
 			continue
 		}
 		walkExpressions(current.Expressions, func(via, blockType string, blockIndex int, rawRef string) {
-			targets := resolveTargets(prefix, rawRef, instances)
-			if len(targets) == 0 {
+			// qualifyRef drops what can never name a resource — a variable, a
+			// count index — so those never reach the bundle.
+			target := qualifyRef(prefix, strings.Split(rawRef, "."))
+			if target == "" || target == source {
 				return
 			}
-			for _, source := range sources {
-				for _, target := range matchInstances(source, targets) {
-					if target == source {
-						continue
-					}
-					item := Relation{
-						Source: source, Target: target, Via: via,
-						BlockType: blockType, BlockIndex: blockIndex, RawRef: rawRef,
-					}
-					key := relationKey(item)
-					if existing, seen := relations[key]; seen && !preferRef(item.RawRef, existing.RawRef) {
-						continue
-					}
-					relations[key] = item
-				}
-			}
+			seen[Reference{
+				Source: source, Via: via, BlockType: blockType,
+				BlockIndex: blockIndex, Ref: target,
+			}] = true
 		})
 	}
 	for name, call := range module.ModuleCalls {
 		if call.Module != nil {
-			collectModuleRelationships(call.Module, qualify(prefix, "module."+name), instances, relations)
+			collectModuleReferences(call.Module, prefix+"module."+name+".", seen)
 		}
 	}
 }
 
-// matchInstances decides which instances of a target a given source instance
-// actually refers to.
-//
-// Counted resources are usually declared in parallel — subnet[i] belongs to route
-// table[i] — so an index that exists on both sides pairs them one to one. Where no
-// such pairing exists the reference really is one-to-many, as in an autoscaling
-// group naming every private subnet, and every instance is reported.
-func matchInstances(source string, targets []string) []string {
-	if len(targets) == 1 {
-		return targets
-	}
-	if index := trailingIndex.FindStringSubmatch(source); index != nil {
-		for _, target := range targets {
-			if match := trailingIndex.FindStringSubmatch(target); match != nil && match[1] == index[1] {
-				return []string{target}
-			}
-		}
-	}
-	return targets
-}
-
-// bareAddress strips every count or for_each subscript, giving the address as the
-// configuration spells it.
+// bareAddress strips count and for_each subscripts, giving the form the
+// configuration writes an address in.
 func bareAddress(address string) string {
 	return indexSuffix.ReplaceAllString(address, "")
-}
-
-// relationKey deliberately excludes RawRef. Terraform reports a single reference
-// twice, once as "aws_vpc.main" and once as "aws_vpc.main.id", and keying on the
-// raw text would emit both as separate edges.
-func relationKey(item Relation) string {
-	hash := sha256.Sum256([]byte(strings.Join([]string{
-		item.Source, item.Target, item.Via, item.BlockType,
-		strconv.Itoa(item.BlockIndex),
-	}, "\x00")))
-	return hex.EncodeToString(hash[:])
-}
-
-// preferRef picks between two spellings of the same reference. The longer one
-// carries the attribute that was actually read ("aws_vpc.main.id" over
-// "aws_vpc.main"), which is strictly more information for a consumer trying to
-// resolve an indirect reference. Length ties break lexicographically so that the
-// choice does not depend on map iteration order.
-func preferRef(candidate, existing string) bool {
-	if len(candidate) != len(existing) {
-		return len(candidate) > len(existing)
-	}
-	return candidate < existing
-}
-
-func qualify(prefix, address string) string {
-	if prefix == "" {
-		return address
-	}
-	return prefix + "." + address
-}
-
-// resolveTargets turns a raw reference into the plan resources it names. A
-// reference inside a module body is usually module-relative, but may already be
-// absolute, so try the qualified form first and fall back to the bare one.
-func resolveTargets(prefix, rawRef string, instances map[string][]string) []string {
-	address := resourceAddress(rawRef)
-	if address == "" {
-		return nil
-	}
-	if prefix != "" {
-		if found := instances[bareAddress(qualify(prefix, address))]; len(found) > 0 {
-			return found
-		}
-	}
-	return instances[bareAddress(address)]
 }
 
 // walkExpressions reports every reference in a resource's expressions, tagged with

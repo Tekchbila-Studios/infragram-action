@@ -15,18 +15,22 @@ func bundleFrom(t *testing.T, planJSON string) *Bundle {
 	return bundle
 }
 
-// findRelation returns the single relation matching source/target/via, failing if
-// there is not exactly one.
-func findRelation(t *testing.T, bundle *Bundle, source, target, via string) Relation {
+// findReference returns the single reference matching source/ref/via,
+// failing if there is not exactly one.
+//
+// References are unresolved: source and rawRef are the addresses the
+// configuration writes, without count subscripts. Pairing them to concrete
+// and is tested there.
+func findReference(t *testing.T, bundle *Bundle, source, ref, via string) Reference {
 	t.Helper()
-	var found []Relation
-	for _, relation := range bundle.Relationships {
-		if relation.Source == source && relation.Target == target && relation.Via == via {
-			found = append(found, relation)
+	var found []Reference
+	for _, reference := range bundle.References {
+		if reference.Source == source && reference.Ref == ref && reference.Via == via {
+			found = append(found, reference)
 		}
 	}
 	if len(found) != 1 {
-		t.Fatalf("want exactly one %s -%s-> %s, got %d: %+v", source, via, target, len(found), bundle.Relationships)
+		t.Fatalf("want exactly one %s -%s-> %s, got %d: %+v", source, via, ref, len(found), bundle.References)
 	}
 	return found[0]
 }
@@ -59,8 +63,8 @@ func TestCollectRemovesSensitiveAndCredentialFields(t *testing.T) {
 			t.Fatalf("bundle removed topology %q: %s", topology, text)
 		}
 	}
-	if bundle.SchemaVersion != 2 {
-		t.Errorf("schema_version = %d, want 2", bundle.SchemaVersion)
+	if bundle.SchemaVersion != SchemaVersion {
+		t.Errorf("schema_version = %d, want %d", bundle.SchemaVersion, SchemaVersion)
 	}
 }
 
@@ -78,17 +82,17 @@ func TestTopLevelReferenceHasNoBlock(t *testing.T) {
   ]}}
 }`)
 
-	relation := findRelation(t, bundle, "aws_subnet.public", "aws_vpc.main", "vpc_id")
-	if relation.BlockType != "" {
-		t.Errorf("block_type = %q, want empty", relation.BlockType)
+	reference := findReference(t, bundle, "aws_subnet.public", "aws_vpc.main", "vpc_id")
+	if reference.BlockType != "" {
+		t.Errorf("block_type = %q, want empty", reference.BlockType)
 	}
-	if relation.BlockIndex != -1 {
-		t.Errorf("block_index = %d, want -1", relation.BlockIndex)
+	if reference.BlockIndex != -1 {
+		t.Errorf("block_index = %d, want -1", reference.BlockIndex)
 	}
 	// Terraform reports the same reference twice; only the more specific spelling
 	// should survive, as one edge rather than two.
-	if relation.RawRef != "aws_vpc.main.id" {
-		t.Errorf("raw_ref = %q, want aws_vpc.main.id", relation.RawRef)
+	if reference.Ref != "aws_vpc.main" {
+		t.Errorf("raw_ref = %q, want aws_vpc.main", reference.Ref)
 	}
 }
 
@@ -110,12 +114,12 @@ func TestNestedRouteBlocksCarryTypeAndIndex(t *testing.T) {
   ]}}
 }`)
 
-	gateway := findRelation(t, bundle, "aws_route_table.public", "aws_internet_gateway.main", "gateway_id")
+	gateway := findReference(t, bundle, "aws_route_table.public", "aws_internet_gateway.main", "gateway_id")
 	if gateway.BlockType != "route" || gateway.BlockIndex != 0 {
 		t.Errorf("gateway route: block_type=%q block_index=%d, want route/0", gateway.BlockType, gateway.BlockIndex)
 	}
 
-	peering := findRelation(t, bundle, "aws_route_table.public", "aws_vpc_peering_connection.peer", "vpc_peering_connection_id")
+	peering := findReference(t, bundle, "aws_route_table.public", "aws_vpc_peering_connection.peer", "vpc_peering_connection_id")
 	if peering.BlockType != "route" || peering.BlockIndex != 1 {
 		t.Errorf("peering route: block_type=%q block_index=%d, want route/1", peering.BlockType, peering.BlockIndex)
 	}
@@ -135,9 +139,9 @@ func TestSingleNestedBlockReportsInnerAttribute(t *testing.T) {
   ]}}
 }`)
 
-	relation := findRelation(t, bundle, "aws_eks_cluster.main", "aws_subnet.private", "subnet_ids")
-	if relation.BlockType != "vpc_config" || relation.BlockIndex != 0 {
-		t.Errorf("block_type=%q block_index=%d, want vpc_config/0", relation.BlockType, relation.BlockIndex)
+	reference := findReference(t, bundle, "aws_eks_cluster.main", "aws_subnet.private", "subnet_ids")
+	if reference.BlockType != "vpc_config" || reference.BlockIndex != 0 {
+		t.Errorf("block_type=%q block_index=%d, want vpc_config/0", reference.BlockType, reference.BlockIndex)
 	}
 }
 
@@ -156,9 +160,9 @@ func TestModuleRelationshipsAreQualified(t *testing.T) {
   ]}}}}}
 }`)
 
-	relation := findRelation(t, bundle, "module.network.aws_subnet.public", "module.network.aws_vpc.main", "vpc_id")
-	if relation.BlockIndex != -1 {
-		t.Errorf("block_index = %d, want -1", relation.BlockIndex)
+	reference := findReference(t, bundle, "module.network.aws_subnet.public", "module.network.aws_vpc.main", "vpc_id")
+	if reference.BlockIndex != -1 {
+		t.Errorf("block_index = %d, want -1", reference.BlockIndex)
 	}
 }
 
@@ -251,62 +255,8 @@ func TestCollectIsDeterministic(t *testing.T) {
 	}
 }
 
-// Configuration names a counted resource once, while the plan names every
-// instance. Pairing them is what keeps a module's resources connected at all.
-func TestCountedInstancesArePairedByIndex(t *testing.T) {
-	bundle := bundleFrom(t, `{
-  "format_version":"1.2",
-  "resource_changes":[
-    {"address":"module.vpc.aws_route_table_association.private[0]","module_address":"module.vpc","type":"aws_route_table_association","name":"private","change":{"actions":["create"],"after":{}}},
-    {"address":"module.vpc.aws_route_table_association.private[1]","module_address":"module.vpc","type":"aws_route_table_association","name":"private","change":{"actions":["create"],"after":{}}},
-    {"address":"module.vpc.aws_subnet.private[0]","module_address":"module.vpc","type":"aws_subnet","name":"private","change":{"actions":["create"],"after":{}}},
-    {"address":"module.vpc.aws_subnet.private[1]","module_address":"module.vpc","type":"aws_subnet","name":"private","change":{"actions":["create"],"after":{}}},
-    {"address":"module.vpc.aws_route_table.private[0]","module_address":"module.vpc","type":"aws_route_table","name":"private","change":{"actions":["create"],"after":{}}}
-  ],
-  "configuration":{"root_module":{"resources":[],"module_calls":{"vpc":{"module":{"resources":[
-    {"address":"aws_route_table_association.private","expressions":{
-      "subnet_id":{"references":["aws_subnet.private"]},
-      "route_table_id":{"references":["aws_route_table.private"]}
-    }}
-  ]}}}}}
-}`)
-
-	// Each association takes the subnet with its own index, not every subnet.
-	findRelation(t, bundle, "module.vpc.aws_route_table_association.private[0]", "module.vpc.aws_subnet.private[0]", "subnet_id")
-	findRelation(t, bundle, "module.vpc.aws_route_table_association.private[1]", "module.vpc.aws_subnet.private[1]", "subnet_id")
-	for _, relation := range bundle.Relationships {
-		if relation.Via == "subnet_id" && trailingIndexOf(relation.Source) != trailingIndexOf(relation.Target) {
-			t.Errorf("crossed index pairing: %s -> %s", relation.Source, relation.Target)
-		}
-	}
-
-	// The single route table is shared by both associations.
-	findRelation(t, bundle, "module.vpc.aws_route_table_association.private[0]", "module.vpc.aws_route_table.private[0]", "route_table_id")
-	findRelation(t, bundle, "module.vpc.aws_route_table_association.private[1]", "module.vpc.aws_route_table.private[0]", "route_table_id")
-}
-
-// A reference with no index counterpart is genuinely one-to-many and must reach
-// every instance, as when one resource names every subnet.
-func TestUncountedSourceFansOutToAllInstances(t *testing.T) {
-	bundle := bundleFrom(t, `{
-  "format_version":"1.2",
-  "resource_changes":[
-    {"address":"aws_autoscaling_group.workers","type":"aws_autoscaling_group","name":"workers","change":{"actions":["create"],"after":{}}},
-    {"address":"aws_subnet.private[0]","type":"aws_subnet","name":"private","change":{"actions":["create"],"after":{}}},
-    {"address":"aws_subnet.private[1]","type":"aws_subnet","name":"private","change":{"actions":["create"],"after":{}}}
-  ],
-  "configuration":{"root_module":{"resources":[
-    {"address":"aws_autoscaling_group.workers","expressions":{"vpc_zone_identifier":{"references":["aws_subnet.private"]}}}
-  ]}}
-}`)
-
-	findRelation(t, bundle, "aws_autoscaling_group.workers", "aws_subnet.private[0]", "vpc_zone_identifier")
-	findRelation(t, bundle, "aws_autoscaling_group.workers", "aws_subnet.private[1]", "vpc_zone_identifier")
-}
-
-func trailingIndexOf(address string) string {
-	if match := trailingIndex.FindStringSubmatch(address); match != nil {
-		return match[1]
-	}
-	return ""
-}
+// Instance pairing is no longer tested here.
+//
+// A version 3 bundle reports references unresolved, so which instance of a
+// counted resource a reference means is the renderer's decision. Those cases
+// live with the code that makes them, in internal/bundle of the renderer.

@@ -19,22 +19,26 @@ import (
 func main() {
 	input := flag.String("input", "-", "Terraform plan JSON file, or - for stdin")
 	output := flag.String("output", "-", "sanitized bundle file, or - for stdout")
+	// The plan JSON carries no locals, so a reference through one names
+	// something the plan never defines. Pointing at the configuration lets the
+	// bundle carry what those names refer to; without it they are simply lost.
+	source := flag.String("source", "", "Terraform configuration directory, for reading locals")
 	flag.Parse()
 
-	if err := run(*input, *output); err != nil {
+	if err := run(*input, *output, *source); err != nil {
 		fmt.Fprintf(os.Stderr, "infragram-collect: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(inputPath, outputPath string) error {
+func run(inputPath, outputPath, sourceDir string) error {
 	input, closeInput, err := openInput(inputPath)
 	if err != nil {
 		return err
 	}
 	defer closeInput()
 
-	bundle, err := collect.FromPlanJSON(input)
+	bundle, err := collect.FromPlanJSONWithSource(input, sourceDir)
 	if err != nil {
 		return err
 	}
