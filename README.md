@@ -167,12 +167,14 @@ until apply, so Terraform cannot predict how many instances will be created.
 
 There is no plan to diagram, and retrying cannot produce one. The Action reports this as a warning and exits successfully, so one such root does not turn a whole matrix red when every other environment produced a diagram. Apply what those counts depend on first, or point the Action at a root that can be planned.
 
-Every other plan failure still fails the step.
+The Action skips only when every error diagnostic is this known limitation. Mixed errors, other invalid `count` or `for_each` arguments, and unrecognized diagnostics still fail the step. Terraform's normal readable logs are preserved.
 
 ## Development
 
 ```bash
 go test ./...
 go vet ./...
+bash scripts/run_test.sh
+bash -n scripts/run.sh scripts/run_test.sh
 go build ./cmd/infragram-collect
 ```

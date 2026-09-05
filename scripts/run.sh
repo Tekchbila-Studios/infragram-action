@@ -150,19 +150,18 @@ else
   # environment produced a diagram, and "Invalid count argument" gives no hint
   # that this is a known limitation rather than a mistake they made.
   #
-  # Every other plan failure still fails the step. This is matched narrowly, on
-  # both the diagnostic heading and its body, so a genuinely invalid for_each is
-  # not waved through: the body wraps across lines in Terraform's output, which
-  # is why it is matched separately rather than as one phrase.
+  # Keep Terraform's human-readable output: -json replaces it rather than adding
+  # a diagnostic sidecar. Classify each error separately, never across headings.
   plan_log="$temp_dir/plan.log"
   set +e
   terraform -chdir="$workdir" "${plan_args[@]}" 2>&1 | tee "$plan_log"
-  plan_status=${PIPESTATUS[0]}
+  plan_pipeline_status=("${PIPESTATUS[@]}")
   set -e
+  plan_status=${plan_pipeline_status[0]}
+  [[ "${plan_pipeline_status[1]}" -eq 0 ]] || fail "Could not capture terraform plan output."
 
   if [[ "$plan_status" -ne 0 ]]; then
-    if grep -qE 'Error: Invalid (count|for_each) argument' "$plan_log" \
-      && grep -q 'cannot be determined' "$plan_log"; then
+    if [[ "$plan_status" -eq 1 ]] && node "$GITHUB_ACTION_PATH/scripts/plan-limitation.cjs" "$plan_log"; then
       printf '::warning::No diagram for %s: Terraform cannot plan it, because a count or for_each depends on values that only exist after apply. This is a Terraform limitation rather than a problem with your configuration. Apply what those counts depend on first, or point the action at a root that can be planned.\n' \
         "${INPUT_WORKING_DIRECTORY:-.}"
       exit 0

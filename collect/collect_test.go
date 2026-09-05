@@ -2,6 +2,7 @@ package collect
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -33,6 +34,91 @@ func findReference(t *testing.T, bundle *Bundle, source, ref, via string) Refere
 		t.Fatalf("want exactly one %s -%s-> %s, got %d: %+v", source, via, ref, len(found), bundle.References)
 	}
 	return found[0]
+}
+
+func TestCollectDeniedKeySpellings(t *testing.T) {
+	patterns := []string{
+		"password", "passwd", "secret", "token", "api_key", "private_key",
+		"access_key", "client_secret", "authorization", "cookie", "user_data",
+		"connection_string", "certificate_body", "secret_string",
+	}
+	for _, pattern := range patterns {
+		words := strings.Split(pattern, "_")
+		camel := words[0]
+		pascal := ""
+		for index, word := range words {
+			title := strings.ToUpper(word[:1]) + word[1:]
+			pascal += title
+			if index > 0 {
+				camel += title
+			}
+		}
+		for _, key := range []string{
+			pattern, strings.ToUpper(pattern), strings.ReplaceAll(pattern, "_", "-"),
+			strings.ReplaceAll(pattern, "_", "."), strings.ReplaceAll(pattern, "_", ""),
+			strings.ToUpper(strings.ReplaceAll(pattern, "_", "")), camel, pascal,
+			"DB_" + strings.ToUpper(pattern), "db" + pascal, pascal + "ARN",
+			"db_" + pattern + "_value",
+			"/service/" + pascal, "db:" + pascal, "db " + pascal, "\u00e9" + pascal,
+		} {
+			t.Run(key, func(t *testing.T) {
+				assertCollectedKey(t, key, true)
+			})
+		}
+	}
+	for _, tc := range []struct {
+		key    string
+		denied bool
+	}{
+		{"APIKey", true}, {"apiKEY", true}, {"dbAPIKey", true},
+		{"API_TOKEN", true}, {"OAuthToken", true}, {"DBPassword", true},
+		{"DB.PASSWORD", true}, {"DB-API-KEY", true}, {"db2Password", true},
+		{"/service/Password", true}, {"db:Token", true}, {"db Password", true}, {"\u00e9Secret", true},
+		{"/service/APIKey", true}, {"db:API_KEY", true}, {"\u00e9PASSWORD", true},
+		{"Name", false}, {"CIDR", false}, {"vpcID", false}, {"APIEndpoint", false},
+		{"monkey", false}, {"tokenizer", false}, {"passwordless", false},
+		{"secretary", false}, {"key_pair", false}, {"", false},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			assertCollectedKey(t, tc.key, tc.denied)
+		})
+	}
+}
+
+func assertCollectedKey(t *testing.T, key string, denied bool) {
+	t.Helper()
+	// Exercise nested maps and lists through the actual plan-to-bundle path,
+	// without a sensitivity mask. Check detection separately from sanitization.
+	input := map[string]any{
+		"blocks": []any{map[string]any{key: "sentinel-value"}},
+		"cidr":   "10.0.0.0/16",
+	}
+	if got := ContainsDeniedKey(input); got != denied {
+		t.Errorf("ContainsDeniedKey for %q = %v, want %v", key, got, denied)
+	}
+	values, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := bundleFrom(t, fmt.Sprintf(`{"format_version":"1.2","resource_changes":[{
+		"address":"test.main","change":{"after":%s,"after_sensitive":{}}
+	}]}`, values))
+	clean := bundle.Resources[0].Values
+	if ContainsDeniedKey(clean) {
+		t.Errorf("sanitized values still contain a denied key: %+v", clean)
+	}
+	block := clean["blocks"].([]any)[0].(map[string]any)
+	value, exists := block[key]
+	if exists == denied || exists && value != "sentinel-value" {
+		t.Fatalf("key %q: value=%v exists=%v, denied=%v", key, value, exists, denied)
+	}
+	wantRemoved := 0
+	if denied {
+		wantRemoved = 1
+	}
+	if bundle.Stats.DeniedKeysRemoved != wantRemoved || clean["cidr"] != "10.0.0.0/16" {
+		t.Fatalf("unexpected sanitization: %+v", bundle)
+	}
 }
 
 func TestCollectRemovesSensitiveAndCredentialFields(t *testing.T) {

@@ -203,7 +203,14 @@ func normalizeKey(value string) string {
 	var result strings.Builder
 	for index, r := range value {
 		if index > 0 && r >= 'A' && r <= 'Z' {
-			result.WriteByte('_')
+			previous := value[index-1]
+			// Preserve boundaries after punctuation and non-ASCII characters too,
+			// but do not split acronym runs or duplicate normalized separators.
+			if previous != '_' && previous != '-' && previous != '.' &&
+				(previous < 'A' || previous > 'Z' ||
+					index+1 < len(value) && value[index+1] >= 'a' && value[index+1] <= 'z') {
+				result.WriteByte('_')
+			}
 		}
 		if r == '-' || r == '.' {
 			result.WriteByte('_')
