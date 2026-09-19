@@ -96,7 +96,7 @@
       }
     },
     "symbols": {
-      "description": "What each module-qualified local references. Values never appear: a local holding a literal has no references and is omitted.",
+      "description": "What each module-qualified symbol references: a local, a module input variable (`module.x.var.name`), or a module output (`module.x.name`). Together they carry a reference across a module boundary, which neither half does alone. Values never appear: a symbol holding a literal has no references and is omitted, and a symbol that reaches no resource is not emitted at all.",
       "type": "object",
       "additionalProperties": {
         "type": "array",
