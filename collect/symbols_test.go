@@ -119,20 +119,24 @@ func TestQualifyRefNormalisesModulePrefix(t *testing.T) {
 }
 
 // Names that can never become an edge are dropped at the source rather than
-// travelling to be dropped at the far end.
+// travelling to be dropped at the far end. A variable is not one of them: the
+// call site says what it was handed, so it resolves through the symbol table.
 func TestQualifyRefDropsNonResourceScopes(t *testing.T) {
 	for _, segments := range [][]string{
-		{"var", "cidr"},
 		{"count", "index"},
 		{"each", "value"},
 		{"path", "module"},
 		{"terraform", "workspace"},
 		{"self", "id"},
 		{"local"},
+		{"var"},
 	} {
 		if got := qualifyRef("module.vpc.", segments); got != "" {
 			t.Errorf("qualifyRef(%v) = %q, want empty", segments, got)
 		}
+	}
+	if got := qualifyRef("module.vpc.", []string{"var", "cidr"}); got != "module.vpc.var.cidr" {
+		t.Errorf("qualifyRef(var.cidr) = %q, want module.vpc.var.cidr", got)
 	}
 }
 

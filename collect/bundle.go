@@ -28,8 +28,11 @@ package collect
 // this action in every customer's workflow.
 //
 // A version 3 bundle carries what the configuration says and nothing more:
-// References is every reference as written, and Symbols is what the locals name.
-// Whoever renders it decides what that means.
+// References is every reference as written, and Symbols is what the names in
+// them refer to — locals, and the module inputs and outputs that carry a
+// reference across a module boundary. Whoever renders it decides what that
+// means. The one thing left out is a name that reaches no resource through the
+// table at all, which cannot become an edge under any reading of it.
 const SchemaVersion = 3
 
 // Bundle is the sanitized payload uploaded to Infragr.am.
@@ -40,8 +43,14 @@ type Bundle struct {
 	Resources        []Resource `json:"resources"`
 	// References is every reference each configured resource makes, unresolved.
 	References []Reference `json:"references,omitempty"`
-	// Symbols maps a module-qualified local to what it references. Values never
-	// appear: a local holding a literal has no references and is omitted.
+	// Symbols maps a module-qualified name to what it references: a local, a
+	// module input variable ("module.x.var.name"), or a module output
+	// ("module.x.name"). The last two are what carry a reference across a module
+	// boundary — the callee writes `var.vpc_id`, the caller writes
+	// `module.vpc.vpc_id`, and neither names a resource on its own.
+	//
+	// Values never appear: a symbol holding a literal has no references and is
+	// omitted, and a symbol that reaches no resource is not emitted at all.
 	Symbols map[string][]string `json:"symbols,omitempty"`
 	Stats   Stats               `json:"sanitization"`
 }

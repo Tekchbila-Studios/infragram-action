@@ -50,6 +50,9 @@ type config struct {
 type configModule struct {
 	Resources   []configResource            `json:"resources"`
 	ModuleCalls map[string]configModuleCall `json:"module_calls"`
+	// Outputs is what the module publishes. Only the reference list inside each
+	// output expression is read; a value never leaves the configuration.
+	Outputs map[string]configOutput `json:"outputs"`
 }
 
 type configModuleCall struct {
@@ -57,6 +60,13 @@ type configModuleCall struct {
 	// Source locates a module whose directory the manifest does not record,
 	// which is the case for a local path module.
 	Source string `json:"source"`
+	// Expressions is the argument list at the call site — what each of the
+	// callee's input variables was wired to.
+	Expressions map[string]any `json:"expressions"`
+}
+
+type configOutput struct {
+	Expression any `json:"expression"`
 }
 
 type configResource struct {
@@ -122,16 +132,23 @@ func collect(plan rawPlan, sourceDir string) Bundle {
 	sort.Slice(result.Resources, func(i, j int) bool { return result.Resources[i].Address < result.Resources[j].Address })
 	result.References = collectReferences(plan.Configuration)
 
+	// Module wiring comes out of the plan itself, so it is collected whether or
+	// not a configuration directory was given. Locals need the .tf files.
+	symbols := collectWiringSymbols(plan.Configuration)
 	if sourceDir != "" && len(result.References) > 0 {
 		scanner := newSymbolScanner(sourceDir)
 		scanner.scan(plan.Configuration.RootModule, scanner.rootPath, "")
-		if len(scanner.symbols) > 0 {
-			for _, refs := range scanner.symbols {
-				sort.Strings(refs)
-			}
-			result.Symbols = scanner.symbols
+		for name, refs := range scanner.symbols {
+			symbols[name] = append(symbols[name], refs...)
 		}
 	}
+	if len(symbols) > 0 {
+		for name, refs := range symbols {
+			symbols[name] = sortedUnique(refs)
+		}
+		result.Symbols = symbols
+	}
+	pruneDanglingNames(&result)
 	return result
 }
 

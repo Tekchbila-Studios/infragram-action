@@ -48,6 +48,18 @@ func LocalSymbol(modulePrefix, name string) string {
 	return modulePrefix + "local." + name
 }
 
+// VarSymbol is the name a module input variable is published under, qualified by
+// the module it is declared in — the counterpart of LocalSymbol for the other
+// dangling name a plan carries.
+//
+// A plan records that a resource references `var.vpc_id` and never says what
+// was passed for it, exactly as it never says what a local holds. The call site
+// does say, and it is in the plan: `module_calls.<name>.expressions`. So a
+// variable resolves the same way a local does, one symbol hop further.
+func VarSymbol(modulePrefix, name string) string {
+	return modulePrefix + "var." + name
+}
+
 type moduleManifest struct {
 	Modules []moduleManifestRecord `json:"Modules"`
 }
@@ -278,8 +290,17 @@ func qualifyRef(modulePrefix string, segments []string) string {
 		modulePrefix += "."
 	}
 	switch segments[0] {
-	case "count", "each", "var", "path", "terraform", "self":
+	case "count", "each", "path", "terraform", "self":
 		return ""
+	case "var":
+		// A variable names whatever the call site passed. That is a symbol, not
+		// a resource, so it resolves through the table like a local rather than
+		// being dropped here — dropping it cost every module-wired resource its
+		// link to the things it was handed (cleo #62).
+		if len(segments) < 2 {
+			return ""
+		}
+		return VarSymbol(modulePrefix, segments[1])
 	case "local":
 		if len(segments) < 2 {
 			return ""
@@ -326,3 +347,196 @@ func appendUnique(existing []string, values ...string) []string {
 // resources it carries, and must use this package's spelling of "same resource,
 // different instance" rather than its own.
 func BareAddress(address string) string { return bareAddress(address) }
+
+// collectWiringSymbols reports what a module's inputs and outputs name.
+//
+// Locals are not the only dangling name in a plan. A module-wired resource
+// writes `vpc_id = var.vpc_id`, and the plan says nothing about what var.vpc_id
+// was; the caller writes `module.vpc_endpoints { vpc_id = module.vpc.vpc_id }`,
+// and says nothing about what that output is. Each half is recorded somewhere
+// in the configuration, and neither alone reaches a resource. Joining them is
+// what lets a reference cross a module boundary at all.
+//
+// Two entries per hop, in the spellings qualifyRef produces so a reference
+// written in either module finds them:
+//
+//	module.vpc.vpc_id              -> module.vpc.aws_vpc.this
+//	module.vpc_endpoints.var.vpc_id -> module.vpc.vpc_id
+//
+// Only reference lists are read. An argument or output holding a literal
+// contributes nothing, so no value reaches the bundle — the same rule the
+// locals scanner follows.
+func collectWiringSymbols(configuration *config) map[string][]string {
+	symbols := make(map[string][]string)
+	if configuration == nil || configuration.RootModule == nil {
+		return symbols
+	}
+	collectModuleWiring(configuration.RootModule, "", symbols)
+	return symbols
+}
+
+// collectModuleWiring walks the module tree. prefix is the path of the body
+// being walked, so a call inside it is prefix + "module.<name>.".
+func collectModuleWiring(module *configModule, prefix string, symbols map[string][]string) {
+	if module == nil {
+		return
+	}
+	for name, call := range module.ModuleCalls {
+		callee := prefix + "module." + name + "."
+
+		// What the caller reads. The output's expression is written inside the
+		// callee, so it is the callee's prefix that qualifies it.
+		if call.Module != nil {
+			for output, expression := range call.Module.Outputs {
+				addWiringSymbol(symbols, callee+output, callee, expression.Expression)
+			}
+		}
+
+		// What the callee reads. The argument is written at the call site, so it
+		// is this module's prefix that qualifies it.
+		for argument, expression := range call.Expressions {
+			addWiringSymbol(symbols, VarSymbol(callee, argument), prefix, expression)
+		}
+
+		collectModuleWiring(call.Module, callee, symbols)
+	}
+}
+
+// addWiringSymbol records every reference in expression under key, qualified by
+// the module the expression was written in. A self-reference is dropped: it
+// would make resolution loop without ever naming a resource.
+//
+// Targets are stored without count subscripts. An output referencing both
+// `aws_vpc.this[0].id` and `aws_vpc.this` names one resource twice, and the
+// subscript carries nothing: a symbol is resolved against the bare address, and
+// which instance a reference pairs with is decided later, from the addresses of
+// the resources the bundle actually carries.
+func addWiringSymbol(symbols map[string][]string, key, refPrefix string, expression any) {
+	for _, reference := range expressionReferences(expression) {
+		target := bareAddress(qualifyRef(refPrefix, strings.Split(reference, ".")))
+		if target == "" || target == key {
+			continue
+		}
+		symbols[key] = append(symbols[key], target)
+	}
+}
+
+// sortedUnique orders a symbol's targets and drops duplicates, so the emitted
+// bundle is byte-identical for identical input.
+func sortedUnique(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	sort.Strings(values)
+	unique := values[:1]
+	for _, value := range values[1:] {
+		if value != unique[len(unique)-1] {
+			unique = append(unique, value)
+		}
+	}
+	return unique
+}
+
+// pruneDanglingNames drops symbol names that lead nowhere, and the references
+// that name them.
+//
+// This is not the resolution version 3 moved to the renderer, and it is
+// deliberately narrower than it could be. A reference naming a resource is kept
+// whatever the plan contains — a module declares resources for every optional
+// feature and instantiates a few, and whether an uninstantiated one may still
+// appear in a diagram is the renderer's call, exactly as version 3 intends.
+//
+// What goes is a name that is not a resource and reaches none: `var.region`
+// handed a literal at the call site, an output nothing reads, a local holding a
+// constant. Version 2 dropped `local.*` because it could not see what a local
+// held; with the whole symbol table in hand, such a name cannot become an edge
+// under any interpretation, and carrying it only costs bytes.
+//
+// Without this the table grew 4.5x on a registry VPC module, nearly all of it
+// the module's own inputs and its hundred-odd unread outputs.
+func pruneDanglingNames(bundle *Bundle) {
+	resources := make(map[string]bool, len(bundle.Resources))
+	for _, resource := range bundle.Resources {
+		resources[bareAddress(resource.Address)] = true
+	}
+
+	// A symbol resolves when any target is a resource or a symbol that resolves.
+	// Iterating to a fixpoint terminates on cycles, which a malformed bundle can
+	// contain, where following the chain would not.
+	resolvable := make(map[string]bool, len(bundle.Symbols))
+	for changed := true; changed; {
+		changed = false
+		for name, targets := range bundle.Symbols {
+			if resolvable[name] {
+				continue
+			}
+			for _, target := range targets {
+				if resources[bareAddress(target)] || resolvable[target] {
+					resolvable[name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	kept := bundle.References[:0]
+	for _, reference := range bundle.References {
+		if isSymbolRef(bundle, reference.Ref) && !resolvable[reference.Ref] {
+			continue
+		}
+		kept = append(kept, reference)
+	}
+	bundle.References = kept
+
+	// Keep only the symbols some surviving reference can still walk through.
+	needed := make(map[string]bool, len(bundle.Symbols))
+	var mark func(string)
+	mark = func(name string) {
+		if needed[name] {
+			return
+		}
+		targets, ok := bundle.Symbols[name]
+		if !ok {
+			return
+		}
+		needed[name] = true
+		for _, target := range targets {
+			mark(target)
+		}
+	}
+	for _, reference := range bundle.References {
+		mark(reference.Ref)
+	}
+	for name := range bundle.Symbols {
+		if !needed[name] {
+			delete(bundle.Symbols, name)
+		}
+	}
+	if len(bundle.Symbols) == 0 {
+		bundle.Symbols = nil
+	}
+}
+
+// isSymbolRef reports whether a reference names something the symbol table has
+// to resolve rather than a resource. Being a key is the direct answer; a var or
+// local that never made it into the table is the case that matters, since that
+// is precisely a name leading nowhere.
+func isSymbolRef(bundle *Bundle, reference string) bool {
+	if _, ok := bundle.Symbols[reference]; ok {
+		return true
+	}
+	segments := strings.Split(reference, ".")
+	start := 0
+	for start+1 < len(segments) && segments[start] == "module" {
+		start += 2
+	}
+	if start >= len(segments) {
+		return false
+	}
+	switch segments[start] {
+	case "var", "local":
+		return true
+	}
+	return false
+}
