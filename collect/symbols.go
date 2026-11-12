@@ -388,14 +388,14 @@ func collectModuleWiring(module *configModule, prefix string, symbols map[string
 		// callee, so it is the callee's prefix that qualifies it.
 		if call.Module != nil {
 			for output, expression := range call.Module.Outputs {
-				addWiringSymbol(symbols, callee+output, callee, expression.Expression)
+				addWiringSymbol(symbols, callee+output, callee, expression.Expression, nil)
 			}
 		}
 
 		// What the callee reads. The argument is written at the call site, so it
 		// is this module's prefix that qualifies it.
 		for argument, expression := range call.Expressions {
-			addWiringSymbol(symbols, VarSymbol(callee, argument), prefix, expression)
+			addWiringSymbol(symbols, VarSymbol(callee, argument), prefix, expression, call.ForEach)
 		}
 
 		collectModuleWiring(call.Module, callee, symbols)
@@ -411,13 +411,18 @@ func collectModuleWiring(module *configModule, prefix string, symbols map[string
 // subscript carries nothing: a symbol is resolved against the bare address, and
 // which instance a reference pairs with is decided later, from the addresses of
 // the resources the bundle actually carries.
-func addWiringSymbol(symbols map[string][]string, key, refPrefix string, expression any) {
-	for _, reference := range expressionReferences(expression) {
-		target := bareAddress(qualifyRef(refPrefix, strings.Split(reference, ".")))
-		if target == "" || target == key {
-			continue
+//
+// forEach is the iteration expression of the module call the expression is an
+// argument of, nil for an output; see iterationRefs.
+func addWiringSymbol(symbols map[string][]string, key, refPrefix string, expression, forEach any) {
+	for _, written := range expressionReferences(expression) {
+		for _, reference := range iterationRefs(written, forEach) {
+			target := bareAddress(qualifyRef(refPrefix, strings.Split(reference, ".")))
+			if target == "" || target == key {
+				continue
+			}
+			symbols[key] = append(symbols[key], target)
 		}
-		symbols[key] = append(symbols[key], target)
 	}
 }
 

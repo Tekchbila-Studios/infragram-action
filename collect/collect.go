@@ -63,6 +63,9 @@ type configModuleCall struct {
 	// Expressions is the argument list at the call site — what each of the
 	// callee's input variables was wired to.
 	Expressions map[string]any `json:"expressions"`
+	// ForEach is what the call iterates over. An argument written
+	// `each.value.subnet_id` names nothing by itself; this is what it draws from.
+	ForEach any `json:"for_each_expression"`
 }
 
 type configOutput struct {
@@ -72,6 +75,8 @@ type configOutput struct {
 type configResource struct {
 	Address     string         `json:"address"`
 	Expressions map[string]any `json:"expressions"`
+	// ForEach is what the resource iterates over; see iterationRefs.
+	ForEach any `json:"for_each_expression"`
 }
 
 // FromPlanJSON decodes `terraform show -json` output and returns the sanitized
@@ -300,16 +305,18 @@ func collectModuleReferences(module *configModule, prefix string, seen map[Refer
 			continue
 		}
 		walkExpressions(current.Expressions, func(via, blockType string, blockIndex int, rawRef string) {
-			// qualifyRef drops what can never name a resource — a variable, a
-			// count index — so those never reach the bundle.
-			target := qualifyRef(prefix, strings.Split(rawRef, "."))
-			if target == "" || target == source {
-				return
+			for _, reference := range iterationRefs(rawRef, current.ForEach) {
+				// qualifyRef drops what can never name a resource — a count
+				// index, a path — so those never reach the bundle.
+				target := qualifyRef(prefix, strings.Split(reference, "."))
+				if target == "" || target == source {
+					continue
+				}
+				seen[Reference{
+					Source: source, Via: via, BlockType: blockType,
+					BlockIndex: blockIndex, Ref: target,
+				}] = true
 			}
-			seen[Reference{
-				Source: source, Via: via, BlockType: blockType,
-				BlockIndex: blockIndex, Ref: target,
-			}] = true
 		})
 	}
 	for name, call := range module.ModuleCalls {
@@ -317,6 +324,26 @@ func collectModuleReferences(module *configModule, prefix string, seen map[Refer
 			collectModuleReferences(call.Module, prefix+"module."+name+".", seen)
 		}
 	}
+}
+
+// iterationRefs replaces a reference to the iteration value with what the
+// iteration draws from.
+//
+// `subnet_id = each.value.subnet_id` names no resource and no symbol: the plan
+// records only that the attribute reads `each`. What `each` ranges over is
+// recorded one field away, in the for_each expression of the same resource or
+// module call, and that does name something — usually a local or a variable
+// holding the map. Without the substitution every attribute fed from a
+// for_each lost its link: three instances created from one map had no subnet.
+//
+// The link is to everything the collection references, not to the one element
+// an instance takes from it. Which element pairs with which instance is not in
+// the plan's configuration; the renderer decides, as it does for count.
+func iterationRefs(reference string, forEach any) []string {
+	if reference != "each" && !strings.HasPrefix(reference, "each.") {
+		return []string{reference}
+	}
+	return expressionReferences(forEach)
 }
 
 // bareAddress strips count and for_each subscripts, giving the form the
