@@ -147,3 +147,72 @@ func TestPruneKeepsTheChainItNeeds(t *testing.T) {
 		}
 	}
 }
+
+// forEachPlan is one module called three times from a map held in a local, each
+// instance handed `subnet_id = each.value.subnet_id`. The argument names only
+// `each`; what it draws from is the call's for_each expression.
+const forEachPlan = `{
+  "format_version":"1.2",
+  "resource_changes":[
+    {"address":"aws_subnet.private[0]","type":"aws_subnet","name":"private","change":{"actions":["create"],"after":{}}},
+    {"address":"module.ec2[\"one\"].aws_instance.this[0]","module_address":"module.ec2[\"one\"]","type":"aws_instance","name":"this","change":{"actions":["create"],"after":{}}},
+    {"address":"aws_eip.this[\"a\"]","type":"aws_eip","name":"this","change":{"actions":["create"],"after":{}}}
+  ],
+  "configuration":{"root_module":{
+    "resources":[
+      {"address":"aws_subnet.private","expressions":{}},
+      {"address":"aws_eip.this","for_each_expression":{"references":["aws_subnet.private"]},
+       "expressions":{"subnet_id":{"references":["each.value.id","each.value"]}}}
+    ],
+    "module_calls":{
+      "ec2":{
+        "for_each_expression":{"references":["aws_subnet.private"]},
+        "expressions":{
+          "subnet_id":{"references":["each.value.id","each.value"]},
+          "name":{"references":["each.key"]}
+        },
+        "module":{
+          "resources":[{"address":"aws_instance.this","expressions":{"subnet_id":{"references":["var.subnet_id"]}}}]
+        }
+      }
+    }
+  }}
+}`
+
+// TestForEachModuleArgumentResolvesThroughTheIteration: without the for_each
+// expression the variable has no targets, is pruned as dangling, and takes the
+// instance's only link to its subnet with it.
+func TestForEachModuleArgumentResolvesThroughTheIteration(t *testing.T) {
+	bundle := bundleFrom(t, forEachPlan)
+	findReference(t, bundle, "module.ec2.aws_instance.this", "module.ec2.var.subnet_id", "subnet_id")
+	want := []string{"aws_subnet.private"}
+	if got := bundle.Symbols["module.ec2.var.subnet_id"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("symbols[module.ec2.var.subnet_id] = %v, want %v", got, want)
+	}
+}
+
+// TestForEachResourceAttributeResolvesThroughTheIteration: the same substitution
+// for a resource that iterates directly.
+func TestForEachResourceAttributeResolvesThroughTheIteration(t *testing.T) {
+	bundle := bundleFrom(t, forEachPlan)
+	findReference(t, bundle, "aws_eip.this", "aws_subnet.private", "subnet_id")
+}
+
+// TestIterationRefsLeavesOtherReferencesAlone: only `each` is rewritten, and
+// with no for_each expression it names nothing.
+func TestIterationRefsLeavesOtherReferencesAlone(t *testing.T) {
+	forEach := map[string]any{"references": []any{"local.instances"}}
+	for reference, want := range map[string][]string{
+		"aws_vpc.main.id": {"aws_vpc.main.id"},
+		"each_other.x":    {"each_other.x"},
+		"each.value.id":   {"local.instances"},
+		"each.key":        {"local.instances"},
+	} {
+		if got := iterationRefs(reference, forEach); !reflect.DeepEqual(got, want) {
+			t.Errorf("iterationRefs(%q) = %v, want %v", reference, got, want)
+		}
+	}
+	if got := iterationRefs("each.value", nil); len(got) != 0 {
+		t.Errorf("iterationRefs with no for_each = %v, want none", got)
+	}
+}
