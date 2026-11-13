@@ -156,6 +156,7 @@ func collect(plan rawPlan, sourceDir string) Bundle {
 			symbols[name] = append(symbols[name], refs...)
 		}
 		result.References = mergeReferences(result.References, scanner.references)
+		result.Source = scanner.report()
 	}
 	if len(symbols) > 0 {
 		for name, refs := range symbols {

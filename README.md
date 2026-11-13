@@ -30,6 +30,8 @@ A local holding a literal contributes nothing. `locals { db_password = "hunter2"
 
 A dynamic block is read the same way. `content { description = "db tier", security_groups = [aws_security_group.app.id] }` emits that `security_groups` refers to `aws_security_group.app`; the description is never read. `TestDynamicBlocksNeverEmitValues` pins this.
 
+If a module's source is not on disk, or a `.tf` file will not parse, the collector says so as a warning in your workflow's own log and carries on with what the plan provides. That warning names the module or file. It is written to your log only: it is not part of the bundle and is never uploaded. `TestSourceReportNeverReachesTheBundle` pins this.
+
 The bundle carries what the configuration says and stops there: `references` is every reference each resource makes, unresolved, and `symbols` is what the locals and module inputs name. Resolving them — matching a reference to a resource, deciding which instance of a counted resource it means — happens after upload.
 
 That split is deliberate. Extraction and redaction are this repository's job and are auditable here. Interpreting a reference for a diagram is not, and keeping it here meant every change to it needed a new release of this action in every workflow using it.

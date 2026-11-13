@@ -53,6 +53,32 @@ type Bundle struct {
 	// omitted, and a symbol that reaches no resource is not emitted at all.
 	Symbols map[string][]string `json:"symbols,omitempty"`
 	Stats   Stats               `json:"sanitization"`
+	// Source says what of the configuration could not be read. It is for the
+	// person running the collector and is never encoded into the bundle.
+	Source SourceReport `json:"-"`
+}
+
+// SourceReport lists the parts of the Terraform configuration the collector was
+// pointed at and could not read.
+//
+// Locals and dynamic blocks exist only in the .tf files, so a module whose
+// source is missing loses every link that passes through them, and the diagram
+// is quietly sparser with nothing to say why. The report is what says why. It
+// stays on the machine that ran the collector: module names and file names are
+// printed to that run's own log and are not part of what is uploaded.
+type SourceReport struct {
+	// ModulesUnread are the modules with no readable .tf files: no source
+	// directory is known for them, usually because `terraform init` has not
+	// run where the collector was pointed, or the directory holds none.
+	ModulesUnread []string
+	// FilesUnparsed are .tf files that were found and could not be parsed,
+	// each as "<module>: <file>".
+	FilesUnparsed []string
+}
+
+// Empty reports whether everything was read.
+func (r SourceReport) Empty() bool {
+	return len(r.ModulesUnread) == 0 && len(r.FilesUnparsed) == 0
 }
 
 // Reference is one reference from a configured resource, exactly as written.

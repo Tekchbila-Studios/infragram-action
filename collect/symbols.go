@@ -78,6 +78,10 @@ type symbolScanner struct {
 	// block reads. See dynamic.go.
 	references map[Reference]bool
 	visited    map[string]bool
+	// unread and unparsed are what the scan could not read, reported to the
+	// person running the collector and never uploaded. See SourceReport.
+	unread   map[string]bool
+	unparsed map[string]bool
 }
 
 func newSymbolScanner(rootPath string) *symbolScanner {
@@ -91,6 +95,8 @@ func newSymbolScanner(rootPath string) *symbolScanner {
 		symbols:    make(map[string][]string),
 		references: make(map[Reference]bool),
 		visited:    make(map[string]bool),
+		unread:     make(map[string]bool),
+		unparsed:   make(map[string]bool),
 	}
 }
 
@@ -123,7 +129,7 @@ func (s *symbolScanner) scan(module *configModule, modulePath, modulePrefix stri
 }
 
 func (s *symbolScanner) scanLocals(modulePath, modulePrefix string) {
-	forEachTerraformBody(modulePath, func(body *hclsyntax.Body) {
+	s.forEachBody(modulePath, modulePrefix, func(body *hclsyntax.Body) {
 		for _, block := range body.Blocks {
 			if block.Type != "locals" {
 				continue
@@ -198,44 +204,94 @@ func loadModuleDirs(rootPath string) map[string]string {
 	return dirs
 }
 
-// forEachTerraformBody parses every .tf file directly inside modulePath.
+// forEachBody visits every .tf file directly inside modulePath, and notes what
+// could not be read.
 //
 // Not recursive: terraform does not descend into subdirectories for a module's
 // own configuration, and a nested directory is a different module reached
 // through its own call. A file that will not parse is skipped rather than
 // failing the run — a plan already succeeded against this configuration, so a
 // parse error here is this parser's problem and must not cost the customer their
-// build.
-func forEachTerraformBody(modulePath string, visit func(*hclsyntax.Body)) {
-	if modulePath == "" {
+// build. It is noted, though: a skipped file silently costs the diagram every
+// link that file's locals and dynamic blocks would have supplied.
+func (s *symbolScanner) forEachBody(modulePath, modulePrefix string, visit func(*hclsyntax.Body)) {
+	names, ok := terraformFiles(modulePath)
+	if !ok {
+		s.unread[moduleLabel(modulePrefix)] = true
 		return
+	}
+	for _, name := range names {
+		body := parseTerraformFile(filepath.Join(modulePath, name), name)
+		if body == nil {
+			s.unparsed[moduleLabel(modulePrefix)+": "+name] = true
+			continue
+		}
+		visit(body)
+	}
+}
+
+// terraformFiles lists the .tf files directly inside modulePath, sorted so the
+// emitted bundle is byte-identical for identical input. ok is false when there
+// is nothing to read: no directory is known for the module, it cannot be
+// listed, or it holds no .tf file.
+func terraformFiles(modulePath string) (names []string, ok bool) {
+	if modulePath == "" {
+		return nil, false
 	}
 	entries, err := os.ReadDir(modulePath)
 	if err != nil {
-		return
+		return nil, false
 	}
-	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".tf") {
 			names = append(names, entry.Name())
 		}
 	}
-	// Sorted so the emitted bundle is byte-identical for identical input.
 	sort.Strings(names)
+	return names, len(names) > 0
+}
 
-	for _, name := range names {
-		source, err := os.ReadFile(filepath.Join(modulePath, name))
-		if err != nil {
-			continue
-		}
-		file, diagnostics := hclsyntax.ParseConfig(source, name, hcl.Pos{Line: 1, Column: 1})
-		if diagnostics.HasErrors() || file == nil {
-			continue
-		}
-		if body, ok := file.Body.(*hclsyntax.Body); ok && body != nil {
-			visit(body)
-		}
+// parseTerraformFile returns the file's body, or nil if it cannot be read or
+// parsed.
+func parseTerraformFile(path, name string) *hclsyntax.Body {
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return nil
 	}
+	file, diagnostics := hclsyntax.ParseConfig(source, name, hcl.Pos{Line: 1, Column: 1})
+	if diagnostics.HasErrors() || file == nil {
+		return nil
+	}
+	body, _ := file.Body.(*hclsyntax.Body)
+	return body
+}
+
+// moduleLabel is how a module is named to the person reading a warning.
+func moduleLabel(modulePrefix string) string {
+	if modulePrefix == "" {
+		return "root module"
+	}
+	return strings.TrimSuffix(modulePrefix, ".")
+}
+
+// report lists what the scan could not read, sorted.
+func (s *symbolScanner) report() SourceReport {
+	return SourceReport{
+		ModulesUnread: sortedKeys(s.unread),
+		FilesUnparsed: sortedKeys(s.unparsed),
+	}
+}
+
+func sortedKeys(set map[string]bool) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // expressionRefs reports what an expression names, qualified by the module it

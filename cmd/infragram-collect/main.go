@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/Tekchbila-Studios/infragram-action/collect"
 
@@ -43,6 +44,8 @@ func run(inputPath, outputPath, sourceDir string) error {
 		return err
 	}
 
+	warn(os.Stderr, bundle.Source, os.Getenv("GITHUB_ACTIONS") == "true")
+
 	encoded, err := json.Marshal(bundle)
 	if err != nil {
 		return fmt.Errorf("encode sanitized bundle: %w", err)
@@ -56,6 +59,45 @@ func run(inputPath, outputPath, sourceDir string) error {
 	// The bundle is scanned before upload and deleted afterwards, but it exists on
 	// the runner's disk in between, so keep it readable only by its owner.
 	return os.WriteFile(outputPath, encoded, 0o600)
+}
+
+// maxListed bounds how many names one warning spells out. A root that was never
+// initialised can miss every module it calls.
+const maxListed = 10
+
+// warn tells whoever ran the collector what source it could not read. The
+// bundle is still written: the diagram is drawn from the plan, and is only
+// missing the links that pass through the unread locals and dynamic blocks.
+//
+// This goes to the run's own log and nowhere else. Nothing here is uploaded.
+func warn(out io.Writer, report collect.SourceReport, annotate bool) {
+	prefix, names := "infragram-collect: warning: ", listed
+	if annotate {
+		prefix, names = "::warning::", func(list []string) string { return escapeCommand(listed(list)) }
+	}
+	if len(report.ModulesUnread) > 0 {
+		fmt.Fprintf(out, "%sNo Terraform source could be read for: %s. Links that pass through locals and dynamic blocks there will be missing from the diagram. Check that this step points at the configuration directory and that terraform init has run in it, so module source is present.\n",
+			prefix, names(report.ModulesUnread))
+	}
+	if len(report.FilesUnparsed) > 0 {
+		fmt.Fprintf(out, "%sCould not parse: %s. Links that pass through locals and dynamic blocks in those files will be missing from the diagram.\n",
+			prefix, names(report.FilesUnparsed))
+	}
+}
+
+// listed joins names for a sentence, cutting a long list short.
+func listed(names []string) string {
+	if len(names) <= maxListed {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:maxListed], ", "), len(names)-maxListed)
+}
+
+// escapeCommand makes text safe as the message of a GitHub workflow command. A
+// file name is whatever a pull request's author chose, and a line break in one
+// would otherwise start a command of their own in this step's log.
+func escapeCommand(text string) string {
+	return strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A").Replace(text)
 }
 
 func openInput(path string) (io.Reader, func(), error) {
