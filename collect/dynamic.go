@@ -53,7 +53,7 @@ func (scope iterationScope) with(name string, refs []string) iterationScope {
 // scanDynamicBlocks reads what the dynamic blocks of every resource and data
 // source in one module directory refer to.
 func (s *symbolScanner) scanDynamicBlocks(modulePath, modulePrefix string) {
-	forEachTerraformBody(modulePath, func(body *hclsyntax.Body) {
+	s.forEachBody(modulePath, modulePrefix, func(body *hclsyntax.Body) {
 		for _, block := range body.Blocks {
 			source := blockSource(modulePrefix, block)
 			if source == "" {
