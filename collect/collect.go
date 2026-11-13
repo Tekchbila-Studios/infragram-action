@@ -35,9 +35,11 @@ type rawPlan struct {
 		Name         string `json:"name"`
 		ProviderName string `json:"provider_name"`
 		Change       struct {
-			Actions        []string `json:"actions"`
-			After          any      `json:"after"`
-			AfterSensitive any      `json:"after_sensitive"`
+			Actions         []string `json:"actions"`
+			Before          any      `json:"before"`
+			After           any      `json:"after"`
+			BeforeSensitive any      `json:"before_sensitive"`
+			AfterSensitive  any      `json:"after_sensitive"`
 		} `json:"change"`
 	} `json:"resource_changes"`
 	Configuration *config `json:"configuration"`
@@ -88,12 +90,12 @@ func FromPlanJSON(input io.Reader) (*Bundle, error) {
 	return FromPlanJSONWithSource(input, "")
 }
 
-// FromPlanJSONWithSource additionally reads the configuration's locals from the
-// .tf files under sourceDir, which the plan JSON does not carry.
+// FromPlanJSONWithSource additionally reads, from the .tf files under sourceDir,
+// the two things the plan JSON does not carry: locals and dynamic blocks.
 //
-// Only `locals` blocks are read, and only the names and references inside them.
-// An unreadable or absent directory is not an error: it yields a bundle with no
-// symbols, which is exactly what version 2 produced.
+// Only `locals` blocks and the dynamic blocks of resources are read, and only
+// the names and references inside them. An unreadable or absent directory is
+// not an error: it yields a bundle with only what the plan says.
 func FromPlanJSONWithSource(input io.Reader, sourceDir string) (*Bundle, error) {
 	decoder := json.NewDecoder(io.LimitReader(input, maxPlanBytes))
 	// Numbers are kept as their original literals. Round-tripping them through
@@ -123,7 +125,14 @@ func collect(plan rawPlan, sourceDir string) Bundle {
 	}
 
 	for _, change := range plan.ResourceChanges {
-		values, keep := sanitize(change.Change.After, change.Change.AfterSensitive, &result.Stats)
+		// A resource being destroyed has no planned value: `after` is null and
+		// what it is — its name, the VPC it sits in — is only in `before`.
+		// Without it the resource arrives with nothing to draw it from.
+		planned, sensitive := change.Change.After, change.Change.AfterSensitive
+		if planned == nil {
+			planned, sensitive = change.Change.Before, change.Change.BeforeSensitive
+		}
+		values, keep := sanitize(planned, sensitive, &result.Stats)
 		valueMap, _ := values.(map[string]any)
 		if !keep {
 			valueMap = nil
@@ -140,12 +149,13 @@ func collect(plan rawPlan, sourceDir string) Bundle {
 	// Module wiring comes out of the plan itself, so it is collected whether or
 	// not a configuration directory was given. Locals need the .tf files.
 	symbols := collectWiringSymbols(plan.Configuration)
-	if sourceDir != "" && len(result.References) > 0 {
+	if sourceDir != "" && plan.Configuration != nil {
 		scanner := newSymbolScanner(sourceDir)
 		scanner.scan(plan.Configuration.RootModule, scanner.rootPath, "")
 		for name, refs := range scanner.symbols {
 			symbols[name] = append(symbols[name], refs...)
 		}
+		result.References = mergeReferences(result.References, scanner.references)
 	}
 	if len(symbols) > 0 {
 		for name, refs := range symbols {
@@ -266,6 +276,26 @@ func collectReferences(configuration *config) []Reference {
 	seen := make(map[Reference]bool)
 	collectModuleReferences(configuration.RootModule, "", seen)
 
+	return sortedReferences(seen)
+}
+
+// mergeReferences adds the references read from source to the ones read from
+// the plan, dropping any the plan already reported.
+func mergeReferences(planned []Reference, scanned map[Reference]bool) []Reference {
+	if len(scanned) == 0 {
+		return planned
+	}
+	seen := make(map[Reference]bool, len(planned)+len(scanned))
+	for _, reference := range planned {
+		seen[reference] = true
+	}
+	for reference := range scanned {
+		seen[reference] = true
+	}
+	return sortedReferences(seen)
+}
+
+func sortedReferences(seen map[Reference]bool) []Reference {
 	result := make([]Reference, 0, len(seen))
 	for item := range seen {
 		result = append(result, item)
