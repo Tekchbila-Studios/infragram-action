@@ -28,7 +28,8 @@ import (
 // So the collector reads the configuration's .tf files. What it takes from them
 // is deliberately narrow:
 //
-//   - only `locals` blocks, and only the names and the references inside them
+//   - `locals` blocks: only the names and the references inside them
+//   - dynamic blocks of resources: only the names and references (dynamic.go)
 //   - never an attribute's value, never file contents, never anything else
 //
 // A local holding a literal — `locals { db_password = "..." }` — contributes an
@@ -73,6 +74,9 @@ type symbolScanner struct {
 	rootPath   string
 	moduleDirs map[string]string
 	symbols    map[string][]string
+	// references are the ones only the source can supply: what a dynamic
+	// block reads. See dynamic.go.
+	references map[Reference]bool
 	visited    map[string]bool
 }
 
@@ -85,6 +89,7 @@ func newSymbolScanner(rootPath string) *symbolScanner {
 		rootPath:   absolute,
 		moduleDirs: loadModuleDirs(absolute),
 		symbols:    make(map[string][]string),
+		references: make(map[Reference]bool),
 		visited:    make(map[string]bool),
 	}
 }
@@ -108,6 +113,7 @@ func (s *symbolScanner) scan(module *configModule, modulePath, modulePrefix stri
 	s.visited[key] = true
 
 	s.scanLocals(modulePath, modulePrefix)
+	s.scanDynamicBlocks(modulePath, modulePrefix)
 
 	for name, call := range module.ModuleCalls {
 		childPrefix := modulePrefix + "module." + name + "."
