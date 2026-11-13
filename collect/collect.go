@@ -35,9 +35,11 @@ type rawPlan struct {
 		Name         string `json:"name"`
 		ProviderName string `json:"provider_name"`
 		Change       struct {
-			Actions        []string `json:"actions"`
-			After          any      `json:"after"`
-			AfterSensitive any      `json:"after_sensitive"`
+			Actions         []string `json:"actions"`
+			Before          any      `json:"before"`
+			After           any      `json:"after"`
+			BeforeSensitive any      `json:"before_sensitive"`
+			AfterSensitive  any      `json:"after_sensitive"`
 		} `json:"change"`
 	} `json:"resource_changes"`
 	Configuration *config `json:"configuration"`
@@ -123,7 +125,14 @@ func collect(plan rawPlan, sourceDir string) Bundle {
 	}
 
 	for _, change := range plan.ResourceChanges {
-		values, keep := sanitize(change.Change.After, change.Change.AfterSensitive, &result.Stats)
+		// A resource being destroyed has no planned value: `after` is null and
+		// what it is — its name, the VPC it sits in — is only in `before`.
+		// Without it the resource arrives with nothing to draw it from.
+		planned, sensitive := change.Change.After, change.Change.AfterSensitive
+		if planned == nil {
+			planned, sensitive = change.Change.Before, change.Change.BeforeSensitive
+		}
+		values, keep := sanitize(planned, sensitive, &result.Stats)
 		valueMap, _ := values.(map[string]any)
 		if !keep {
 			valueMap = nil

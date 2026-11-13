@@ -346,3 +346,29 @@ func TestCollectIsDeterministic(t *testing.T) {
 // A version 3 bundle reports references unresolved, so which instance of a
 // counted resource a reference means is the renderer's decision. Those cases
 // live with the code that makes them, in internal/bundle of the renderer.
+
+// TestDestroyedResourceKeepsItsPriorValues: a delete has no `after`, so the
+// values come from `before`, through the same redaction.
+func TestDestroyedResourceKeepsItsPriorValues(t *testing.T) {
+	bundle := bundleFrom(t, `{
+  "format_version":"1.2",
+  "resource_changes":[
+    {"address":"aws_db_instance.old","type":"aws_db_instance","name":"old","change":{
+      "actions":["delete"],
+      "before":{"identifier":"orders","password":"hunter2","endpoint":"db.internal"},
+      "after":null,
+      "before_sensitive":{"endpoint":true},
+      "after_sensitive":false
+    }}
+  ]
+}`)
+	values := bundle.Resources[0].Values
+	if values["identifier"] != "orders" {
+		t.Errorf("identifier = %v, want orders", values["identifier"])
+	}
+	for _, key := range []string{"password", "endpoint"} {
+		if _, present := values[key]; present {
+			t.Errorf("%s survived redaction: %v", key, values[key])
+		}
+	}
+}
